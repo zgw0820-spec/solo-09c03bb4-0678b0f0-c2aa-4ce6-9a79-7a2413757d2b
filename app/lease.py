@@ -75,11 +75,28 @@ def acquire(
 
     Returns a lease when the job is unowned or its holder's heartbeat is stale.
     If this worker already owns it, the same epoch is renewed and returned, so a
-    worker can call this on every poll.  ``None`` means another live worker owns
-    the job.  Every new ownership takes a fresh, never-reused epoch.
+    worker can call this on every poll.  ``None`` means the job is not
+    claimable: it does not exist, it is already completed, or another live
+    worker owns it.  Every new ownership takes a fresh, never-reused epoch.
+
+    The job row is read *inside* the same write transaction as the lease
+    update.  A worker often builds its candidate list a moment earlier; if
+    another worker finishes the job in between, this re-check is what stops the
+    late worker from claiming a completed job.
     """
     now = time.time()
     with transaction(path) as conn:
+        job = conn.execute(
+            "SELECT status, completed_steps, total_batches, epochs FROM jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if job is None or job["status"] not in ("queued", "running"):
+            return None
+        if int(job["completed_steps"]) >= int(job["total_batches"]) * int(job["epochs"]):
+            # Terminal job: drop any lease left behind by its last owner so a
+            # later poll or /workers read does not show phantom work.
+            conn.execute("DELETE FROM leases WHERE job_id=?", (job_id,))
+            return None
         row = conn.execute("SELECT * FROM leases WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             epoch = _allocate_epoch(conn, job_id)

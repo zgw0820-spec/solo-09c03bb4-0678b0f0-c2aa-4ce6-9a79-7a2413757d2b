@@ -76,6 +76,17 @@ class Worker:
                     continue
                 try:
                     self._train()
+                except Exception as exc:  # noqa: BLE001 - one job must not kill the worker
+                    # A stale claim, a job deleted underneath us or a transient
+                    # database error must not take this worker out of service:
+                    # the lease is released below and the next poll continues
+                    # with whatever jobs are still pending.
+                    failed_job = self.lease.job_id if self.lease else "?"
+                    print(
+                        f"[{self.worker_id}] job {failed_job} failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
                 finally:
                     if self.lease is not None:
                         lease_mod.release(self.settings.db_path, self.lease)
@@ -103,22 +114,20 @@ class Worker:
     def _train(self) -> None:
         assert self.lease is not None
         job_id = self.lease.job_id
-        job = store.get_job(self.settings.db_path, job_id)
-        if job is None:
+        started = store.start_training(self.settings.db_path, self.lease)
+        if started is None:
+            # The candidate list was stale: the job was completed by another
+            # worker (or the lease moved on) after the scan.  Do not log a
+            # start here; drop our claim and go look for real pending work.
+            print(
+                f"[{self.worker_id}] {job_id} is no longer claimable; skipping",
+                flush=True,
+            )
             return
-        store.record_event(
-            self.settings.db_path,
-            job_id,
-            "training_started",
-            {
-                "worker_id": self.worker_id,
-                "lease_epoch": self.lease.epoch,
-                "resumed_from_step": job["completed_steps"],
-            },
-        )
         print(
             f"[{self.worker_id}] training {job_id} from step "
-            f"{job['completed_steps']}/{job['total_steps']} (lease epoch {self.lease.epoch})",
+            f"{started['completed_steps']}/{started['total_steps']} "
+            f"(lease epoch {self.lease.epoch})",
             flush=True,
         )
         while not self.stop_event.is_set():
@@ -149,6 +158,9 @@ class Worker:
                 flush=True,
             )
             if result["status"] == "completed":
+                # Either this commit finished the job, or another owner had
+                # already finished it.  Both are a clean hand-back; the outer
+                # loop releases the lease and continues with other jobs.
                 print(f"[{self.worker_id}] completed {job_id}", flush=True)
                 return
             self._pause_after_batch(job_id)

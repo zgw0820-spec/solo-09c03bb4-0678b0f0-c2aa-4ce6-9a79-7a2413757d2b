@@ -132,3 +132,145 @@ def test_worker_survives_a_crash_preventing_commit(tmp_path):
     epochs = [c["lease_epoch"] for c in checkpoints]
     assert epochs[:2] == [1, 1]
     assert epochs[2:] == [2] * 7
+
+
+def test_worker_skips_a_job_completed_between_scan_and_claim(tmp_path):
+    """B's candidate list is stale: A already completed the job.
+
+    B must not record a start event for it, must not fail, and must still be
+    able to pick up a newly submitted pending job afterwards.
+    """
+    settings = make_settings(tmp_path)
+    init_db(settings.db_path)
+    features, labels = sample(16, seed=7)
+    finished = store.create_job(settings.db_path, features, labels, 2)
+
+    lm.register_worker(settings.db_path, "A")
+    lease = lm.acquire(settings.db_path, finished["job_id"], "A", settings.lease_seconds)
+    while store.advance_job(settings.db_path, lease)["status"] != "completed":
+        pass
+    lm.release(settings.db_path, lease)
+    events_before = store.list_events(settings.db_path, finished["job_id"])
+
+    # B scanned the directory before A finished and still holds the id.
+    worker = Worker(settings, "B")
+    worker.lease = lm.Lease(finished["job_id"], "B", 99)
+    worker._train()  # must not raise and must not log a start
+    assert store.list_events(settings.db_path, finished["job_id"]) == events_before
+    worker.lease = None
+
+    pending = store.create_job(settings.db_path, features, labels, 2)
+    worker, thread = run_worker(settings, "B")
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if store.get_job(settings.db_path, pending["job_id"])["status"] == "completed":
+                break
+            time.sleep(0.02)
+    finally:
+        stop(worker, thread)
+    final = store.get_job(settings.db_path, pending["job_id"])
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == final["total_steps"]
+
+
+def test_poll_loop_drops_a_stale_completed_candidate_and_keeps_serving(tmp_path, monkeypatch):
+    """Reproduces the reported interleaving end to end at the worker level.
+
+    A completes J1 and releases it while B is working from a scan that still
+    listed J1 as pending.  B must not claim J1, must not log a start event for
+    it, and must keep polling - so a newly submitted J2 still gets trained.
+    """
+    settings = make_settings(tmp_path)
+    init_db(settings.db_path)
+    features, labels = sample(16, seed=9)
+    finished = store.create_job(settings.db_path, features, labels, 2)
+
+    # Worker A finishes and releases the job before B tries to claim it.
+    lm.register_worker(settings.db_path, "A")
+    lease_a = lm.acquire(settings.db_path, finished["job_id"], "A", settings.lease_seconds)
+    while store.advance_job(settings.db_path, lease_a)["status"] != "completed":
+        pass
+    lm.release(settings.db_path, lease_a)
+    events_before = store.list_events(settings.db_path, finished["job_id"])
+    completed_before = store.get_job(settings.db_path, finished["job_id"])
+
+    real_claimable = store.claimable_jobs
+    scans = {"count": 0}
+
+    def stale_first_scans(db_path, limit=20):
+        scans["count"] += 1
+        if scans["count"] <= 3:
+            return [finished["job_id"]]  # B's stale snapshot
+        return real_claimable(db_path, limit)
+
+    monkeypatch.setattr(store, "claimable_jobs", stale_first_scans)
+
+    worker, thread = run_worker(settings, "B")
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and scans["count"] < 2:
+            time.sleep(0.01)
+        pending = store.create_job(settings.db_path, features, labels, 2)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if store.get_job(settings.db_path, pending["job_id"])["status"] == "completed":
+                break
+            time.sleep(0.02)
+    finally:
+        stop(worker, thread)
+
+    assert scans["count"] > 3, "B never got past its stale candidate list"
+    # J1 untouched: same events, same completion state, no B start event.
+    assert store.list_events(settings.db_path, finished["job_id"]) == events_before
+    assert store.get_job(settings.db_path, finished["job_id"]) == completed_before
+    started = [
+        e
+        for e in store.list_events(settings.db_path, pending["job_id"])
+        if e["event"] == "training_started"
+    ]
+    assert [e["detail"]["worker_id"] for e in started] == ["B"]
+    final = store.get_job(settings.db_path, pending["job_id"])
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == final["total_steps"]
+
+
+def test_one_failing_job_does_not_take_the_worker_out_of_service(tmp_path, monkeypatch):
+    """An unexpected job-level error is logged, released, and the poll loop
+    continues with the next pending job (the reported 'new jobs stay queued'
+    symptom)."""
+    settings = make_settings(tmp_path)
+    init_db(settings.db_path)
+    features, labels = sample(16, seed=8)
+    first = store.create_job(settings.db_path, features, labels, 2)
+    second = store.create_job(settings.db_path, features, labels, 2)
+
+    real_advance = store.advance_job
+    failed_once = {"done": False}
+
+    def flaky(db_path, lease, batch_delay=0.0):
+        if lease.job_id == first["job_id"] and not failed_once["done"]:
+            failed_once["done"] = True
+            raise RuntimeError("boom")
+        return real_advance(db_path, lease, batch_delay)
+
+    monkeypatch.setattr(store, "advance_job", flaky)
+
+    worker, thread = run_worker(settings, "w1")
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            jobs = [store.get_job(settings.db_path, job["job_id"]) for job in (first, second)]
+            if all(job["status"] == "completed" for job in jobs):
+                break
+            time.sleep(0.02)
+    finally:
+        stop(worker, thread)
+
+    assert failed_once["done"] is True
+    for job in (first, second):
+        final = store.get_job(settings.db_path, job["job_id"])
+        assert final["status"] == "completed"
+        assert final["completed_steps"] == final["total_steps"]
+        steps = [c["step"] for c in store.list_checkpoints(settings.db_path, job["job_id"])]
+        assert steps == list(range(1, final["total_steps"] + 1))

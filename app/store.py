@@ -251,6 +251,12 @@ def list_events(db_path, job_id: str, limit: int = 200) -> list[dict[str, Any]]:
 
 
 def claimable_jobs(db_path, limit: int = 20) -> list[str]:
+    """Jobs that look claimable right now.
+
+    This is only a candidate list: the status and progress are re-read inside
+    the lease transaction in :func:`app.lease.acquire`, because a job here can
+    be completed by another worker before this worker tries to claim it.
+    """
     with reader(db_path) as conn:
         rows = conn.execute(
             """
@@ -262,6 +268,33 @@ def claimable_jobs(db_path, limit: int = 20) -> list[str]:
             (limit,),
         ).fetchall()
     return [row["job_id"] for row in rows]
+
+
+def claim_state(conn, job_id: str, lease: Lease) -> tuple[bool, Any | None]:
+    """Check, in an open write transaction, whether ``lease`` may start training.
+
+    Returns ``(owned, job_row)`` where ``job_row`` is the raw SQLite row.
+    ``owned`` is true only while the caller is still the lease holder *and* the
+    job is still unfinished.  A worker whose candidate list went stale - the
+    previous owner completed the job in between - must not log a start event or
+    claim any progress.
+
+    If the caller still holds the lease but the job is finished, ownership is
+    released in the same transaction: a completed job must not keep a lease
+    that a later poll could mistake for live work.
+    """
+    row = _job_row(conn, job_id)
+    if row is None or not owner_ok(conn, lease):
+        return False, row
+    if row["status"] not in ("queued", "running"):
+        return False, row
+    if int(row["completed_steps"]) >= int(row["total_batches"]) * int(row["epochs"]):
+        conn.execute(
+            "DELETE FROM leases WHERE job_id=? AND worker_id=? AND epoch=?",
+            (job_id, lease.worker_id, lease.epoch),
+        )
+        return False, row
+    return True, row
 
 
 def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, Any]:
@@ -283,19 +316,24 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
         row = _job_row(conn, lease.job_id)
         if row is None:
             raise JobNotFound(lease.job_id)
+        total_steps = int(row["total_batches"]) * int(row["epochs"])
         if row["status"] == "completed":
+            # Someone else (or an earlier run) already finished the job.  This
+            # is a clean no-op, not an error: the worker stops training it and
+            # goes back to looking for unfinished jobs.
             return {
                 "status": "completed",
                 "job_id": lease.job_id,
                 "step": int(row["completed_steps"]),
-                "total_steps": int(row["total_batches"]) * int(row["epochs"]),
+                "total_steps": total_steps,
+                "batch_loss": None,
+                "loss": float(row["loss"]),
                 "worker_id": lease.worker_id,
                 "lease_epoch": lease.epoch,
             }
 
         completed = int(row["completed_steps"])
         per_epoch = int(row["total_batches"])
-        total_steps = per_epoch * int(row["epochs"])
         if completed >= total_steps:
             raise StateConflict("job has no remaining steps but is not marked completed")
 
@@ -385,3 +423,37 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
 def record_event(db_path, job_id: str, event: str, detail: dict[str, Any] | None = None) -> None:
     with transaction(db_path) as conn:
         _event(conn, job_id, event, detail)
+
+
+def start_training(db_path, lease: Lease) -> dict[str, Any] | None:
+    """Record ``training_started`` only if ``lease`` may still train the job.
+
+    The ownership and completion check and the event insert happen in one
+    write transaction.  Returns the resume point on success, ``None`` when the
+    job was completed or the lease moved on between the candidate scan and
+    this call - in both cases the caller must not log a start, not train, and
+    must continue looking for other unfinished work.
+    """
+    with transaction(db_path) as conn:
+        owned, row = claim_state(conn, lease.job_id, lease)
+        if not owned:
+            return None
+        completed = int(row["completed_steps"])
+        total = int(row["total_batches"]) * int(row["epochs"])
+        _event(
+            conn,
+            lease.job_id,
+            "training_started",
+            {
+                "worker_id": lease.worker_id,
+                "lease_epoch": lease.epoch,
+                "resumed_from_step": completed,
+            },
+        )
+    return {
+        "job_id": lease.job_id,
+        "completed_steps": completed,
+        "total_steps": total,
+        "status": row["status"],
+    }
+

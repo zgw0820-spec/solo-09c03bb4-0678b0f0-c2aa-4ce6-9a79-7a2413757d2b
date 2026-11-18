@@ -222,6 +222,97 @@ def test_crash_and_takeover_matches_uninterrupted(tmp_path, uninterrupted):
         assert starts[1]["detail"]["resumed_from_step"] == at_crash["completed_steps"]
 
 
+def test_worker_starting_after_completion_does_not_stall_new_jobs(tmp_path):
+    """The reported incident, at process level.
+
+    A trains a job to completion and releases it.  B starts only afterwards,
+    with the same shared database - it must see no claimable work, must not
+    write a start event against the finished job, and must still pick up a job
+    submitted after it is already running.
+    """
+    db = tmp_path / "training.db"
+    with Server(db, free_port()) as server:
+        first = server.post("/jobs", dataset(records=16, seed=31))
+        worker_a = start_worker(db, "worker-a")
+        try:
+            completed = wait_completed(server, first["job_id"])
+        finally:
+            stop_worker(worker_a)
+
+        events_before = server.get(f"/jobs/{first['job_id']}/events")
+        checkpoints_before = server.get(f"/jobs/{first['job_id']}/checkpoints")
+        workers_before = server.get("/workers")
+        assert workers_before["leases"] == []
+
+        worker_b = start_worker(db, "worker-b")
+        try:
+            # Let B poll the database with only the finished job present.
+            time.sleep(BATCH_DELAY * 6)
+            assert server.get(f"/jobs/{first['job_id']}/events") == events_before
+            assert server.get(f"/jobs/{first['job_id']}/checkpoints") == checkpoints_before
+
+            second = server.post("/jobs", dataset(records=16, seed=32))
+            final = wait_completed(server, second["job_id"])
+        finally:
+            stop_worker(worker_b)
+
+        assert final["status"] == "completed"
+        assert final["completed_steps"] == final["total_steps"]
+        checkpoints = server.get(f"/jobs/{second['job_id']}/checkpoints")
+        assert [c["step"] for c in checkpoints] == list(range(1, final["total_steps"] + 1))
+        assert {c["worker_id"] for c in checkpoints} == {"worker-b"}
+        starts = [
+            e
+            for e in server.get(f"/jobs/{second['job_id']}/events")
+            if e["event"] == "training_started"
+        ]
+        assert [e["detail"]["worker_id"] for e in starts] == ["worker-b"]
+
+        # The first job's completion state never regressed.
+        after = server.get(f"/jobs/{first['job_id']}")
+        assert after == completed
+        assert after["final_weights"] == completed["final_weights"]
+
+
+def test_completion_race_between_scan_and_claim_cannot_start_or_stall(tmp_path):
+    """B's candidate scan races A's final commit; B must skip and keep going.
+
+    The race is made deterministic by making worker B ignore one completion:
+    B starts while the job is pending, and A completes it.  Whatever the exact
+    interleaving, B may only write checkpoints for steps A had not reached,
+    must never log a ``training_started`` after completion, and the process
+    stays alive to serve the next job.
+    """
+    db = tmp_path / "training.db"
+    with Server(db, free_port()) as server:
+        job = server.post("/jobs", dataset(records=16, seed=33))
+        worker_a = start_worker(db, "worker-a")
+        worker_b = start_worker(db, "worker-b")
+        try:
+            completed = wait_completed(server, job["job_id"])
+        finally:
+            stop_worker(worker_a)
+
+        events = server.get(f"/jobs/{job['job_id']}/events")
+        finished_at = server.get(f"/jobs/{job['job_id']}")["finished_at"]
+        starts = [e for e in events if e["event"] == "training_started"]
+        assert sum(e["event"] == "job_completed" for e in events) == 1
+        # Any start event was recorded before the completion.
+        assert all(e["created_at"] <= finished_at for e in starts)
+        assert len({(e["detail"]["worker_id"], e["detail"]["lease_epoch"]) for e in starts}) == len(
+            starts
+        )
+
+        followed = server.post("/jobs", dataset(records=16, seed=34))
+        try:
+            final = wait_completed(server, followed["job_id"])
+        finally:
+            stop_worker(worker_b)
+        assert final["status"] == "completed"
+        assert final["completed_steps"] == final["total_steps"]
+        assert server.get(f"/jobs/{job['job_id']}")["finished_at"] == finished_at
+
+
 def test_late_worker_cannot_regress_or_false_complete(tmp_path):
     """A is suspended between batches until its lease expires; B takes over.
 

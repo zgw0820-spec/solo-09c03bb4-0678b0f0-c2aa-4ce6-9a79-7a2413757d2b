@@ -272,3 +272,110 @@ def test_reacquired_lease_never_reuses_an_epoch(settings):
     assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 0
     store.advance_job(settings.db_path, second)
     assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 1
+
+
+def test_completed_job_cannot_be_claimed_from_a_stale_candidate_list(settings):
+    """B scanned while the job was pending; A then completed and released it.
+
+    B must not be able to acquire the finished job, so it never reaches the
+    point of recording a start event for it.
+    """
+    features, labels = sample(16, seed=13)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "A")
+    lm.register_worker(settings.db_path, "B")
+    # B's candidate scan: the job is still unfinished here.
+    stale_candidates = store.claimable_jobs(settings.db_path)
+    assert job["job_id"] in stale_candidates
+
+    lease_a = lm.acquire(settings.db_path, job["job_id"], "A", settings.lease_seconds)
+    while True:
+        if store.advance_job(settings.db_path, lease_a)["status"] == "completed":
+            break
+    lm.release(settings.db_path, lease_a)
+    done = store.get_job(settings.db_path, job["job_id"])
+    events_before = store.list_events(settings.db_path, job["job_id"])
+
+    assert lm.acquire(settings.db_path, job["job_id"], "B", settings.lease_seconds) is None
+    assert lm.holder(settings.db_path, job["job_id"]) is None
+    assert store.start_training(
+        settings.db_path, lm.Lease(job["job_id"], "B", 99)
+    ) is None
+    assert store.list_events(settings.db_path, job["job_id"]) == events_before
+    assert store.get_job(settings.db_path, job["job_id"]) == done
+
+
+def test_late_worker_cannot_record_start_after_lease_transfer(settings):
+    """B holds a lease, A takes it over; B's start event must be rejected."""
+    features, labels = sample(16, seed=14)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "A")
+    lm.register_worker(settings.db_path, "B")
+
+    b = lm.acquire(settings.db_path, job["job_id"], "B", settings.lease_seconds)
+    assert b is not None
+    time.sleep(settings.lease_seconds + 0.05)
+    a = lm.acquire(settings.db_path, job["job_id"], "A", settings.lease_seconds)
+    assert a is not None and a.epoch == b.epoch + 1
+
+    events_before = store.list_events(settings.db_path, job["job_id"])
+    assert store.start_training(settings.db_path, b) is None
+    assert store.list_events(settings.db_path, job["job_id"]) == events_before
+    # B must not release or otherwise disturb A's lease.
+    assert lm.holder(settings.db_path, job["job_id"])[:2] == ("A", a.epoch)
+    with pytest.raises(LeaseLost):
+        store.advance_job(settings.db_path, b)
+
+    started = store.start_training(settings.db_path, a)
+    assert started == {
+        "job_id": job["job_id"],
+        "completed_steps": 0,
+        "total_steps": job["total_steps"],
+        "status": "queued",
+    }
+
+
+def test_start_event_is_not_duplicated_for_a_completed_job(settings):
+    """Once a job is completed, no further start event is accepted, and the
+    completion state itself is untouched."""
+    features, labels = sample(8, seed=15)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "w")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w", settings.lease_seconds)
+    assert store.start_training(settings.db_path, lease) is not None
+    while True:
+        if store.advance_job(settings.db_path, lease)["status"] == "completed":
+            break
+    completed = store.get_job(settings.db_path, job["job_id"])
+    events = store.list_events(settings.db_path, job["job_id"])
+    assert sum(e["event"] == "training_started" for e in events) == 1
+    assert sum(e["event"] == "job_completed" for e in events) == 1
+
+    assert store.start_training(settings.db_path, lease) is None
+    assert store.list_events(settings.db_path, job["job_id"]) == events
+    assert store.get_job(settings.db_path, job["job_id"]) == completed
+
+
+def test_advance_on_an_already_completed_job_is_a_clean_noop(settings):
+    """The losing side of the completion race gets a normal result, not a
+    KeyError that would kill the worker process, and writes nothing."""
+    features, labels = sample(8, seed=16)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "owner")
+    lease = lm.acquire(settings.db_path, job["job_id"], "owner", settings.lease_seconds)
+    while True:
+        if store.advance_job(settings.db_path, lease)["status"] == "completed":
+            break
+    completed = store.get_job(settings.db_path, job["job_id"])
+    checkpoints = store.list_checkpoints(settings.db_path, job["job_id"])
+    events = store.list_events(settings.db_path, job["job_id"])
+
+    result = store.advance_job(settings.db_path, lease)
+    assert result["status"] == "completed"
+    assert result["step"] == completed["total_steps"]
+    assert result["loss"] == completed["loss"]
+    assert result["total_steps"] == completed["total_steps"]
+    assert store.list_checkpoints(settings.db_path, job["job_id"]) == checkpoints
+    assert store.list_events(settings.db_path, job["job_id"]) == events
+    assert store.get_job(settings.db_path, job["job_id"]) == completed
+
